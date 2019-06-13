@@ -139,22 +139,22 @@ void loop() {
 
   // Main state machine
   switch(heater_state){
-    case 0:
+    case STATE_OFF:
       interval = 0;
       ledcWrite(HEATER_PIN, 0);
       ledcWrite(FAN_PIN, 0);
       break;
-    case 1:
+    case STATE_COLD:
       interval = 800;
       ledcWrite(HEATER_PIN, 0);
       ledcWrite(FAN_PIN, 80);
       break;
-    case 2:
+    case STATE_WARM:
       interval = 200;
       ledcWrite(HEATER_PIN, 170);
       ledcWrite(FAN_PIN, 130);
       break;
-    case 3:
+    case STATE_HOT:
       digitalWrite(STATUS_LED_PIN, HIGH);
       ledcWrite(HEATER_PIN, 255);
       ledcWrite(FAN_PIN, 200);
