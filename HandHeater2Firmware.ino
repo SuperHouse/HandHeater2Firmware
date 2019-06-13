@@ -1,16 +1,17 @@
 /*
-  Hand heater controller for ESP32.
+  Hand heater controller for ESP32
+  Copyright 2019 SuperHouse Automation Pty Ltd
+  Author: Jonathan Oxer <jon@oxer.com.au>
 
   ESP32 board profile:
   Go into Preferences -> Additional Board Manager URLs
   Add:
    xxxx ADD URL HERE
 
-  Then go to Tools -> Board -> Board Manager, update, and add "ESP32"
+  Then go to Tools -> Board -> Boards Manager..., update, and add "esp32 by Espressif Systems"
 
   Arduino IDE settings:
-  Board: ""
-  Frequency: "240MHz"
+  Board: "Adafruit ESP32 Feather"
 
   ﻿GPIO5: CAN TX
   GPIO4: CAN RX
@@ -30,7 +31,7 @@
 #define BUTTON_PIN       14
 #define HEATER_PIN       16  // PWM
 #define FAN_PIN          17  // PWM
-#define STATUS_LED_PIN   13 //25
+#define STATUS_LED_PIN   25
 #define TEMP_SENSOR_PIN  32
 #define FAN_TACHO_PIN    33
 
@@ -46,22 +47,28 @@
 // Maximum safe output temperature in Celsius
 #define TEMPERATURE_SAFE_LIMIT 50
 
+// How often to check the fan tacho, in milliseconds
+#define FAN_CHECK_INTERVAL  500
+uint16_t fan_last_checked = 0;
+
 unsigned long previousMillis = 0;  
-int interval = 0;  // LED flash interval in milliseconds
+int interval = 0;  // LED flash interval in milliseconds (0 is always on)
 int led_state = LOW;   
 
-uint8_t heater_state = STATE_OFF;
-byte last_button_state = 0;
+uint8_t  heater_state      = STATE_OFF;
+uint8_t  last_button_state = 0;
 uint16_t last_button_press = 0;
+uint16_t fan_pulses        = 0;
+uint16_t fan_speed         = 0;
 
-#define FAN_FREQUENCY     15000
-#define FAN_CHANNEL           0
-#define FAN_RESOLUTION        8
-#define HEATER_FREQUENCY   5000
-#define HEATER_CHANNEL        1
-#define HEATER_RESOLUTION     8
+#define FAN_FREQUENCY     15000   // PWM frequency for fan control
+#define FAN_CHANNEL           0   // PWM output channel for fan
+#define FAN_RESOLUTION        8   // PWM resolution for fan
+#define HEATER_FREQUENCY   5000   // PWM frequency for heater control
+#define HEATER_CHANNEL        1   // PWM output channel for heater
+#define HEATER_RESOLUTION     8   // PWM resolution for heater
 
-
+// Make sure Bluetooth is available in the ESP32 core
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
 #endif
@@ -76,7 +83,7 @@ void setup() {
   Serial.println("Hand heater 2 starting up");
 
   SerialBT.begin("Heater"); //Bluetooth device name
-  Serial.println("Bluetooth has started, now you can pair with the device called 'Heater'");
+  Serial.println("Bluetooth has started. Pair with the device called 'Heater'");
   
   ledcSetup(FAN_CHANNEL, FAN_FREQUENCY, FAN_RESOLUTION);
   ledcAttachPin(FAN_PIN, FAN_CHANNEL);
@@ -88,12 +95,23 @@ void setup() {
   pinMode(STATUS_LED_PIN, OUTPUT);
   pinMode(TEMP_SENSOR_PIN, INPUT);
 
+  // Start with the LED, fan, and heater off
   digitalWrite(STATUS_LED_PIN, LOW);
-  
   ledcWrite(FAN_CHANNEL,    0);
   ledcWrite(HEATER_CHANNEL, 0);
+
+  // Detect pulses from the fan tacho using an interrupt
+  pinMode(FAN_TACHO_PIN, INPUT_PULLUP);
+  attachInterrupt(FAN_TACHO_PIN, fan_tacho_isr, FALLING);
 }
 
+/**
+ * Called when a pulse is detected from the fan tacho
+ */
+void fan_tacho_isr()
+{
+  fan_pulses++;
+}
 
 /**
  * Loop
@@ -110,6 +128,9 @@ void loop() {
 
   // Flash the status LED
   led_flasher();
+
+  // Process accumulated fan tacho pulses to determine the speed
+  process_fan_tacho();
 
   // Check the temperature sensor for an over-temp condition. Do this
   // after all other checks so that it will override commands from other
@@ -141,6 +162,22 @@ void loop() {
   }
 }
 
+
+/**
+ * Check how many pulses have been received from the fan tacho
+ */
+void process_fan_tacho()
+{
+  uint16_t time_now = millis();
+  if((time_now - fan_last_checked) > FAN_CHECK_INTERVAL)
+  {
+    fan_speed = fan_pulses * (60 / FAN_CHECK_INTERVAL);
+    fan_pulses = 0;
+    fan_last_checked = time_now;
+    Serial.print("Fan speed: ");
+    Serial.println(fan_speed);
+  }
+}
 
 /**
  * See if the button has been pressed, and apply de-bouncing
