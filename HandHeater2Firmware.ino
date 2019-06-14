@@ -11,7 +11,15 @@
   Then go to Tools -> Board -> Boards Manager..., update, and add "esp32 by Espressif Systems"
 
   Arduino IDE settings:
-  Board: "Adafruit ESP32 Feather"
+  Board:            ESP32 Dev Board
+  Upload speed:     115200bps
+  CPU Speed:        240MHz
+  Flash Frequency:  40MHz
+  Flash Mode:       DOUT
+  Flash Size:       4MB
+  Partition Scheme: Default
+  Core Debug Level: None
+  PSRAM:            Disabled
 
   ﻿GPIO5: CAN TX
   GPIO4: CAN RX
@@ -47,12 +55,16 @@
 // Maximum safe output temperature in Celsius
 #define TEMPERATURE_SAFE_LIMIT 50
 
-// How often to check the fan tacho, in milliseconds
-#define FAN_CHECK_INTERVAL  500
+// How often to check the fan tacho, in seconds
+#define FAN_CHECK_INTERVAL  1
 uint16_t fan_last_checked = 0;
 
+// How often to check the temperature, in seconds
+#define TEMPERATURE_CHECK_INTERVAL  1
+uint16_t temperature_last_checked = 0;
+
 unsigned long previousMillis = 0;  
-int interval = 0;  // LED flash interval in milliseconds (0 is always on)
+int led_blink_interval = 0;  // LED flash interval in milliseconds (0 is always on)
 int led_state = LOW;   
 
 uint8_t  heater_state      = STATE_OFF;
@@ -85,20 +97,23 @@ void setup() {
   SerialBT.begin("Heater"); //Bluetooth device name
   Serial.println("Bluetooth has started. Pair with the device called 'Heater'");
   
+  pinMode(HEATER_PIN,      OUTPUT);
+  pinMode(FAN_PIN,         OUTPUT);
+  pinMode(BUTTON_PIN,      INPUT_PULLUP);
+  pinMode(STATUS_LED_PIN,  OUTPUT);
+  pinMode(TEMP_SENSOR_PIN, INPUT);
+
+  // Use the LED driving timers for fan and heater output
   ledcSetup(FAN_CHANNEL, FAN_FREQUENCY, FAN_RESOLUTION);
   ledcAttachPin(FAN_PIN, FAN_CHANNEL);
+  ledcWrite(FAN_CHANNEL, 0);
 
   ledcSetup(HEATER_CHANNEL, HEATER_FREQUENCY, HEATER_RESOLUTION);
   ledcAttachPin(HEATER_PIN, HEATER_CHANNEL);
-  
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  pinMode(TEMP_SENSOR_PIN, INPUT);
-
-  // Start with the LED, fan, and heater off
-  digitalWrite(STATUS_LED_PIN, LOW);
-  ledcWrite(FAN_CHANNEL,    0);
   ledcWrite(HEATER_CHANNEL, 0);
+
+  // Start with the LED off
+  digitalWrite(STATUS_LED_PIN, LOW);
 
   // Detect pulses from the fan tacho using an interrupt
   pinMode(FAN_TACHO_PIN, INPUT_PULLUP);
@@ -138,26 +153,28 @@ void loop() {
   check_temperature();
 
   // Main state machine
+  //Serial.print("State: ");
+  //Serial.println(heater_state);
   switch(heater_state){
     case STATE_OFF:
-      interval = 0;
-      ledcWrite(HEATER_PIN, 0);
-      ledcWrite(FAN_PIN, 0);
+      led_blink_interval = 0;
+      ledcWrite(HEATER_CHANNEL, 0);
+      ledcWrite(FAN_CHANNEL, 0);
       break;
     case STATE_COLD:
-      interval = 800;
-      ledcWrite(HEATER_PIN, 0);
-      ledcWrite(FAN_PIN, 80);
+      led_blink_interval = 800;
+      ledcWrite(HEATER_CHANNEL, 0);
+      ledcWrite(FAN_CHANNEL, 80);
       break;
     case STATE_WARM:
-      interval = 200;
-      ledcWrite(HEATER_PIN, 170);
-      ledcWrite(FAN_PIN, 130);
+      led_blink_interval = 200;
+      ledcWrite(HEATER_CHANNEL, 100);
+      ledcWrite(FAN_CHANNEL, 120);
       break;
     case STATE_HOT:
       digitalWrite(STATUS_LED_PIN, HIGH);
-      ledcWrite(HEATER_PIN, 255);
-      ledcWrite(FAN_PIN, 200);
+      ledcWrite(HEATER_CHANNEL, 150);
+      ledcWrite(FAN_CHANNEL, 200);
       break;
   }
 }
@@ -169,8 +186,11 @@ void loop() {
 void process_fan_tacho()
 {
   uint16_t time_now = millis();
-  if((time_now - fan_last_checked) > FAN_CHECK_INTERVAL)
+  uint16_t fan_speed = 0;
+  if((time_now - fan_last_checked) > (FAN_CHECK_INTERVAL * 1000))
   {
+    //Serial.print(fan_pulses);
+    //Serial.print("  ");
     fan_speed = fan_pulses * (60 / FAN_CHECK_INTERVAL);
     fan_pulses = 0;
     fan_last_checked = time_now;
@@ -185,14 +205,11 @@ void process_fan_tacho()
 void check_button()
 {
   byte button_state = digitalRead(BUTTON_PIN);
-  if((button_state == HIGH) && (last_button_state == LOW) && (millis() - last_button_press > 200))
+  //Serial.print(button_state);
+  if((button_state == LOW) && (last_button_state == HIGH) && (millis() - last_button_press > 200))
   {
     // We've detected a button press. Change state.
-    heater_state++;
-    if(heater_state >= STATE_HOT) // If we've hit the end state, loop back to the start
-    {
-      heater_state = 0;
-    }
+    increment_heater_state();
     last_button_press = millis();
   }
   last_button_state = button_state;
@@ -270,34 +287,39 @@ void check_bt_serial()
   }
 }
 
-
 /**
  * Blink the LED at a set interval
  */
 void led_flasher()
 {
-  if ((millis() - previousMillis >= interval) && (interval >0)) {
+  if ((millis() - previousMillis >= led_blink_interval) && (led_blink_interval >0)) {
     // save the last time you blinked the LED
     previousMillis = millis();
     // if the LED is off turn it on and vice-versa:
     led_state = !led_state;
     digitalWrite(STATUS_LED_PIN, led_state);
-  } else if(interval == 0) {
+  } else if(led_blink_interval == 0) {
     digitalWrite(STATUS_LED_PIN, LOW);
   }
 }
-
 
 /**
  * Check whether we've exceeded the temperature limit and shut down if necessary
  */
 void check_temperature()
 {
-  int current_temperature = getTemp();
+  if ((millis() - temperature_last_checked >= TEMPERATURE_CHECK_INTERVAL) && (TEMPERATURE_CHECK_INTERVAL >0)) {
+    // save the last time we checked temperature
+    temperature_last_checked = millis();
+    int current_temperature = getTemp();
+    Serial.print("Temperature: ");
+    Serial.print(current_temperature);
+    Serial.println("C");
 
-  if(current_temperature > TEMPERATURE_SAFE_LIMIT)
-  {
-    heater_state = STATE_OFF;
+    if(current_temperature > TEMPERATURE_SAFE_LIMIT)
+    {
+      heater_state = STATE_OFF;
+    }
   }
 }
 
@@ -306,45 +328,45 @@ void check_temperature()
  * https://chrisholdt.com/2018/01/03/esp32-light-temperature-oled/
  */
 int getTemp() {
-    double thermalSamples[5];
-    double average, kelvin, resistance, celsius;
-    int i;
+  double thermalSamples[5];
+  double average, kelvin, resistance, celsius;
+  int i;
     
-    // Collect SAMPLERATE (default 5) samples
-    for (i=0; i<5; i++) {
-        thermalSamples[i] = analogRead(TEMP_SENSOR_PIN);
-        delay(10);
-    }
+  // Collect SAMPLERATE (default 5) samples
+  for (i=0; i<5; i++) {
+    thermalSamples[i] = analogRead(TEMP_SENSOR_PIN);
+    delay(10);
+  }
     
-    // Calculate the average value of the samples
-    average = 0;
-    for (i=0; i<5; i++) {
-        average += thermalSamples[i];
-    }
-    average /= 5;
+  // Calculate the average value of the samples
+  average = 0;
+  for (i=0; i<5; i++) {
+    average += thermalSamples[i];
+  }
+  average /= 5;
 
-    // Convert to resistance
-    resistance = 4095 / average - 1;
-    resistance = 10000 / resistance;
+  // Convert to resistance
+  resistance = 4095 / average - 1;
+  resistance = 10000 / resistance;
 
-    /*
-     * Use Steinhart equation (simplified B parameter equation) to convert resistance to kelvin
-     * B param eq: T = 1/( 1/To + 1/B * ln(R/Ro) )
-     * T  = Temperature in Kelvin
-     * R  = Resistance measured
-     * Ro = Resistance at nominal temperature
-     * B  = Coefficent of the thermistor
-     * To = Nominal temperature in kelvin
-     */
-    kelvin = resistance/10000;            // R/Ro
-    kelvin = log(kelvin);                 // ln(R/Ro)
-    kelvin = (1.0/BCOEFFICIENT) * kelvin; // 1/B * ln(R/Ro)
-    kelvin = (1.0/(25+273.15)) + kelvin;  // 1/To + 1/B * ln(R/Ro)
-    kelvin = 1.0/kelvin;                  // 1/( 1/To + 1/B * ln(R/Ro) )
+  /*
+   * Use Steinhart equation (simplified B parameter equation) to convert resistance to kelvin
+   * B param eq: T = 1/( 1/To + 1/B * ln(R/Ro) )
+   * T  = Temperature in Kelvin
+   * R  = Resistance measured
+   * Ro = Resistance at nominal temperature
+   * B  = Coefficent of the thermistor
+   * To = Nominal temperature in kelvin
+   */
+  kelvin = resistance/10000;            // R/Ro
+  kelvin = log(kelvin);                 // ln(R/Ro)
+  kelvin = (1.0/BCOEFFICIENT) * kelvin; // 1/B * ln(R/Ro)
+  kelvin = (1.0/(25+273.15)) + kelvin;  // 1/To + 1/B * ln(R/Ro)
+  kelvin = 1.0/kelvin;                  // 1/( 1/To + 1/B * ln(R/Ro) )
     
-    // Convert Kelvin to Celsius
-    celsius = kelvin - 273.15;
+  // Convert Kelvin to Celsius
+  celsius = kelvin - 273.15;
     
-    // Send the value back to be displayed
-    return celsius;
+  // Send the value back to be displayed
+  return celsius;
 }
