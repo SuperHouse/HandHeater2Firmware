@@ -292,7 +292,7 @@ void check_bt_serial()
  */
 void led_flasher()
 {
-  if ((millis() - previousMillis >= led_blink_interval) && (led_blink_interval >0)) {
+  if ((millis() - previousMillis >= led_blink_interval) && (led_blink_interval > 0)) {
     // save the last time you blinked the LED
     previousMillis = millis();
     // if the LED is off turn it on and vice-versa:
@@ -308,7 +308,9 @@ void led_flasher()
  */
 void check_temperature()
 {
-  if ((millis() - temperature_last_checked >= TEMPERATURE_CHECK_INTERVAL) && (TEMPERATURE_CHECK_INTERVAL >0)) {
+  uint16_t time_now = millis();
+  if((time_now - temperature_last_checked) > (TEMPERATURE_CHECK_INTERVAL * 1000))
+  {
     // save the last time we checked temperature
     temperature_last_checked = millis();
     int current_temperature = getTemp();
