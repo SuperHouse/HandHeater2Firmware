@@ -34,22 +34,24 @@
   GPIO33: Fan tacho
 */
 
-/*    YOUR LOCAL CONFIGURATION   */
+/*   YOUR LOCAL CONFIGURATION   */
 #include "config.h"
 
+
+/*   NO NEED TO CHANGE ANYTHING BELOW THIS LINE FOR CONFIGURATION   */
 /* WiFi library */
-#ifdef ENABLE_WIFI
+#if ENABLE_WIFI
   #include <WiFi.h>
   WiFiClient espClient;
 #endif
 
 /* Bluetooth library */
-#ifdef ENABLE_BLUETOOTH
+#if ENABLE_BLUETOOTH
   #include "BluetoothSerial.h"
 #endif
 
 /* CAN bus library setup */
-#ifdef ENABLE_CAN
+#if ENABLE_CAN
   #include <ESP32CAN.h>
   #include <CAN_config.h>
   CAN_device_t CAN_cfg;  // The variable name CAN_cfg is fixed, do not change
@@ -57,13 +59,15 @@
 #endif
 
 /* MQTT library */
-#ifdef ENABLE_MQTT
+#if ENABLE_MQTT
   #include <PubSubClient.h>
   PubSubClient client(espClient);
   long lastMsg = 0;
   char msg[50];
   char command_topic[20];
-  //String device_id = "default";
+  char status_topic[20];
+  char temperature_topic[30];
+  char fan_topic[20];
 #endif
 
 
@@ -89,16 +93,21 @@
 // Maximum safe output temperature in Celsius
 #define TEMPERATURE_SAFE_LIMIT 50
 
-// How often to check the fan tacho, in seconds
-#define FAN_CHECK_INTERVAL  1
-uint32_t fan_last_checked = 0;
+// How often to process accumulated fan tacho pulses, in seconds
+#define FAN_TACHO_PROCESS_INTERVAL  0.5
+uint32_t fan_tacho_last_processed = 0;
+
+// How often to check that the fan is functional, in seconds
+#define FAN_CHECK_INTERVAL   2
+#define FAN_FAIL_COUNT_LIMIT 3
+uint32_t fan_last_checked  = 0;
 
 // How often to report the fan tacho, in seconds
-#define FAN_SPEED_REPORT_INTERVAL  2
-long fan_speed_last_reported = 0;
+#define FAN_SPEED_REPORT_INTERVAL  1
+uint32_t fan_speed_last_reported = 0;
 
 // How often to check the temperature, in seconds
-#define TEMPERATURE_CHECK_INTERVAL  0.5
+#define TEMPERATURE_CHECK_INTERVAL  1
 uint32_t temperature_last_checked = 0;
 
 // How often to report the temperature, in seconds
@@ -113,9 +122,11 @@ uint8_t  led_state          = LOW;
 uint8_t  heater_state        = STATE_OFF;
 uint8_t  last_button_state   = 0;
 uint32_t last_button_press   = 0;
-uint32_t fan_pulses          = 0;
-uint32_t fan_speed           = 0;
+uint32_t fan_pulses          = 0;   // Accumulate pulses from fan tacho
+uint32_t fan_speed           = 0;   // The current fan speed
+uint32_t fan_fail_count      = 0;   // We have to see it fail on multiple consecutive checks
 int16_t  current_temperature = 0;
+uint8_t  wifi_status_reported = false;
 uint64_t chip_id;
 char device_id[8];
 
@@ -126,7 +137,7 @@ char device_id[8];
 #define HEATER_CHANNEL        1   // PWM output channel for heater
 #define HEATER_RESOLUTION     8   // PWM resolution for heater
 
-#ifdef ENABLE_BLUETOOTH
+#if ENABLE_BLUETOOTH
   // Make sure Bluetooth is available in the ESP32 core
   #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
     #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
@@ -140,44 +151,53 @@ char device_id[8];
 void setup() {
   Serial.begin(9600);
   Serial.println("Hand heater 2 starting up");
+  Serial.print("Firmware version: ");
+  Serial.println(FIRMWARE_VERSION);
 
-  // Get a unique device ID to use for MQTT connections
-  chip_id = ESP.getEfuseMac();  //The chip ID is essentially its MAC address(length: 6 bytes).
-  //Serial.printf("%08X\n",(uint32_t)chipid);//print Low 4bytes.
-
-  sprintf(device_id, "%x", chip_id);
-  //device_id = String(chip_id, HEX);  // Get the unique ID of the ESP32 chip in hex
+  // Get a unique device ID to use for MQTT connections, Bluetooth, etc
+  chip_id = ESP.getEfuseMac(); // The chip ID is essentially its MAC address (length 6 bytes)
+  //sprintf(device_id, "%04X", (uint16_t)chip_id); // Just use the last 4 bytes
+  sprintf(device_id, "%08X", chip_id); // Use all the bytes
   Serial.print("Device ID: ");
   Serial.println(device_id);
 
-  #ifdef ENABLE_BLUETOOTH
-    SerialBT.begin("Heater2"); //Bluetooth device name
-    Serial.println("== Bluetooth has started. Pair with the device called 'Heater2'");
+  #if ENABLE_BLUETOOTH
+    char bt_id[16];
+    sprintf(bt_id,"Heater-%08X",device_id);
+    SerialBT.begin(bt_id); //Bluetooth device name
+    //SerialBT.begin("Heater2"+device_id); //Bluetooth device name
+    Serial.print("== Bluetooth has started. Pair with the device called '");
+    Serial.print(bt_id);
+    Serial.println("'");
   #else
     Serial.println("== Bluetooth not activated");
   #endif
 
-  #ifdef ENABLE_WIFI
+  #if ENABLE_WIFI
     setup_wifi();
     Serial.println("== WiFi started");
   #else
     Serial.println("== WiFi not activated");
   #endif
 
-  #ifdef ENABLE_CAN
+  #if ENABLE_CAN
     initialise_can_bus();
     Serial.println("== CAN bus started");
   #else
     Serial.println("== CAN bus not activated");
   #endif
 
-  #ifdef ENABLE_MQTT
+  #if ENABLE_MQTT
     client.setServer(MQTT_BROKER, 1883);
     client.setCallback(mqtt_callback);
     Serial.println("== MQTT started");
     // Set up the topics for publishing sensor readings. By inserting the unique ID,
-    // the result is of the form: "cmnd/d9616f/POWER"
-    sprintf(command_topic, "cmnd/%x/POWER", chip_id);  // For receiving messages
+    // the result is of the form: "cmnd/D9616F/POWER"
+    sprintf(command_topic, "cmnd/%08X/POWER", chip_id);     // Receive power commands
+    sprintf(status_topic, "stat/%08X/POWER", chip_id);      // Report power status
+    sprintf(temperature_topic, "stat/%08X/TEMP", chip_id);  // Report temperature
+    sprintf(fan_topic, "stat/%08X/FAN", chip_id);           // Report fan speed
+    
     // Report the topics to the serial console
     Serial.print("Command topic: ");
     Serial.println(command_topic);
@@ -211,7 +231,7 @@ void setup() {
 /**
  * Connect to WiFi
  */
-#ifdef ENABLE_WIFI
+#if ENABLE_WIFI
 void setup_wifi() {
   delay(10);
   // We start by connecting to a WiFi network
@@ -220,21 +240,64 @@ void setup_wifi() {
   Serial.println(WIFI_SSID);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+
+  /*
+  uint8_t wifi_attempt_count = 0;
+  while( wifi_attempt_count < 10 && WiFi.status() != WL_CONNECTED)
+  {
     delay(500);
     Serial.print(".");
+    wifi_attempt_count++;
   }
   Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+
+  if(WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi not found, skipping");
+  }
+  */
+  /*
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+  */
 }
 #endif
 
-#ifdef ENABLE_MQTT
+
+/**
+ * Report WiFi status
+ */
+#if ENABLE_WIFI
+void report_wifi_status()
+{
+  if(wifi_status_reported != true)
+  {
+    if(WiFi.status() == WL_CONNECTED)
+    {
+      Serial.println("WiFi connected");
+      Serial.println("IP address: ");
+      Serial.println(WiFi.localIP());
+      wifi_status_reported = true;
+    }
+  }
+}
+#endif
+
 /**
  * Called when a message arrives
  */
+#if ENABLE_MQTT
 void mqtt_callback(char* topic, byte* message, unsigned int length) {
   Serial.print("Message arrived on topic: ");
   Serial.print(topic);
@@ -247,7 +310,7 @@ void mqtt_callback(char* topic, byte* message, unsigned int length) {
   }
   Serial.println();
 
-  if (String(topic) == "cmnd/heater2/POWER") {
+  if (String(topic) == command_topic) {
     Serial.println(messageTemp);
     if(messageTemp == "+"){
       increment_heater_state();
@@ -255,44 +318,39 @@ void mqtt_callback(char* topic, byte* message, unsigned int length) {
     if(messageTemp == "-"){
       decrement_heater_state();
     }
-  }
-
-  // Feel free to add more if statements to control more GPIOs with MQTT
-  /*
-  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
-  // Changes the output state according to the message
-  if (String(topic) == "esp32/output") {
-    Serial.print("Changing output to ");
-    if(messageTemp == "on"){
-      Serial.println("on");
-      digitalWrite(ledPin, HIGH);
+    if(messageTemp == "ON"){
+      heater_state = STATE_HOT;
     }
-    else if(messageTemp == "off"){
-      Serial.println("off");
-      digitalWrite(ledPin, LOW);
+    if(messageTemp == "OFF"){
+      heater_state = STATE_OFF;
     }
   }
-  */
 }
+#endif
 
 /**
  * Attempt connection to broker
  */
+#if ENABLE_MQTT
 void reconnect_mqtt() {
   // Loop until we're reconnected
-  while (!client.connected()) {
+  if(WiFi.status() == WL_CONNECTED)
+  {
+    while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect("ESP32Client")) {
-      Serial.println("connected");
-      // Subscribe
-      client.subscribe("cmnd/heater2/POWER");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
+      // Attempt to connect
+      if (client.connect("ESP32Client")) {
+        Serial.println("connected");
+        // Subscribe
+      
+        client.subscribe(command_topic);
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" try again in 5 seconds");
+        // Wait 5 seconds before retrying
+        delay(5000);
+      }
     }
   }
 }
@@ -310,7 +368,7 @@ void fan_tacho_isr()
 /**
  * Set up the bus
  */
-#ifdef ENABLE_CAN
+#if ENABLE_CAN
 void initialise_can_bus()
 {
   /* set CAN pins and baudrate */
@@ -329,11 +387,19 @@ void initialise_can_bus()
  */
 void loop() {
   // Process the MQTT queue
-  #ifdef ENABLE_MQTT
+  #if ENABLE_MQTT
     if (!client.connected()) {
       reconnect_mqtt();
     }
     client.loop();
+  #endif
+
+  // Report our IP address etc once only. Don't report again after that
+  #if ENABLE_WIFI
+    if(wifi_status_reported == false)
+    {
+      report_wifi_status();
+    }
   #endif
   
   // Check if the button has been pressed
@@ -343,12 +409,12 @@ void loop() {
   check_usb_serial();
 
   // Check if a command has been sent via the Bluetooth serial port
-  #ifdef ENABLE_BLUETOOTH
+  #if ENABLE_BLUETOOTH
     check_bt_serial();
   #endif
 
   // Check if a command has been sent via CAN bus
-  #ifdef ENABLE_CAN
+  #if ENABLE_CAN
     check_can_bus();
   #endif
 
@@ -359,6 +425,10 @@ void loop() {
   process_fan_tacho_pulses();
   report_fan_speed();
 
+  // Check that the fan is spinning, and kill the output if it's not
+  check_fan();
+  //check_fan2();
+  
   // Check the temperature sensor for an over-temp condition. Do this
   // after all other checks so that it will override commands from other
   // sources
@@ -399,12 +469,12 @@ void loop() {
 void process_fan_tacho_pulses()
 {
   uint32_t time_now = millis();
-  if((time_now - fan_last_checked) > (FAN_CHECK_INTERVAL * 1000))
+  if((time_now - fan_tacho_last_processed) > (FAN_TACHO_PROCESS_INTERVAL * 1000))
   {
-    fan_last_checked = time_now;
+    fan_tacho_last_processed = time_now;
     //Serial.print(fan_pulses);
     //Serial.print("  ");
-    fan_speed = fan_pulses * (60 / FAN_CHECK_INTERVAL);
+    fan_speed = fan_pulses * (60 / FAN_TACHO_PROCESS_INTERVAL);
     fan_pulses = 0;
   }
 }
@@ -422,18 +492,18 @@ void report_fan_speed()
     Serial.print(fan_speed);
     Serial.println("rpm");
 
-    #ifdef ENABLE_BLUETOOTH
+    #if ENABLE_BLUETOOTH
     SerialBT.print("Fan speed: ");
     SerialBT.print(fan_speed);
     SerialBT.println("rpm");
     #endif
 
-    #ifdef ENABLE_MQTT
+    #if ENABLE_MQTT
       char mqttCharBuf[12];
       String mqttStringOne;
       mqttStringOne += fan_speed;
       mqttStringOne.toCharArray(mqttCharBuf, mqttStringOne.length()+1);
-      client.publish("stat/heater2/FAN",mqttCharBuf);
+      client.publish(fan_topic,mqttCharBuf);
     #endif
 
     char charBuf[20];
@@ -441,7 +511,7 @@ void report_fan_speed()
     stringOne += fan_speed;
     stringOne.toCharArray(charBuf, stringOne.length()+1);
 
-    #ifdef ENABLE_CAN
+    #if ENABLE_CAN
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 5;
@@ -483,7 +553,7 @@ void increment_heater_state()
   }
   Serial.print("Setting heater level to ");
   Serial.println(heater_state);
-  #ifdef ENABLE_BLUETOOTH
+  #if ENABLE_BLUETOOTH
     SerialBT.print("Setting heater level to ");
     SerialBT.println(heater_state);
   #endif
@@ -501,7 +571,7 @@ void decrement_heater_state()
   }
   Serial.print("Setting heater level to ");
   Serial.println(heater_state);
-  #ifdef ENABLE_BLUETOOTH
+  #if ENABLE_BLUETOOTH
     SerialBT.print("Setting heater level to ");
     SerialBT.println(heater_state);
   #endif
@@ -515,14 +585,24 @@ void check_usb_serial()
 {
   if (Serial.available())
   {
-    byte character = Serial.read();
-    if(character == '+')
+    String serial_message;
+    serial_message = Serial.readStringUntil('\n');
+    //byte character = Serial.read();
+    if(serial_message == "+")
     {
       increment_heater_state();
     }
-    if(character == '-')
+    if(serial_message == "-")
     {
       decrement_heater_state();
+    }
+    if(serial_message == "ON")
+    {
+      heater_state = STATE_HOT;
+    }
+    if(serial_message == "OFF")
+    {
+      heater_state = STATE_OFF;
     }
   }
 }
@@ -531,19 +611,29 @@ void check_usb_serial()
 /**
  * See if there is a command from the Bluetooth serial port
  */
-#ifdef ENABLE_BLUETOOTH
+#if ENABLE_BLUETOOTH
 void check_bt_serial()
 {
   if (SerialBT.available())
   {
-    byte character = SerialBT.read();
-    if(character == '+')
+    String serial_message;
+    serial_message = SerialBT.readStringUntil('\n');
+    //byte character = Serial.read();
+    if(serial_message == "+")
     {
       increment_heater_state();
     }
-    if(character == '-')
+    if(serial_message == "-")
     {
       decrement_heater_state();
+    }
+    if(serial_message == "ON")
+    {
+      heater_state = STATE_HOT;
+    }
+    if(serial_message == "OFF")
+    {
+      heater_state = STATE_OFF;
     }
   }
 }
@@ -552,7 +642,7 @@ void check_bt_serial()
 /**
  * See if there is a command from CAN bus
  */
-#ifdef ENABLE_CAN
+#if ENABLE_CAN
 void check_can_bus()
 {
   CAN_frame_t rx_frame;
@@ -638,6 +728,42 @@ void check_temperature()
   }
 }
 
+
+/** 
+ *  Check whether the fan has stalled and shut down if necessary
+ */
+void check_fan()
+{
+  uint32_t time_now = millis();
+  if((time_now - fan_last_checked) > (FAN_CHECK_INTERVAL * 1000))
+  {
+    fan_last_checked = time_now;  // save the last time we checked the fan speed
+    if(heater_state > STATE_COLD)
+    {
+      if(fan_speed < 100)
+      {
+        fan_fail_count++;
+        if(fan_fail_count >= FAN_FAIL_COUNT_LIMIT)
+        {
+          Serial.println("ALARM: FAN STALLED. Heater turned off");
+          #if ENABLE_BLUETOOTH
+            SerialBT.println("ALARM: FAN STALLED. Heater turned off");
+          #endif
+          heater_state = STATE_OFF;
+        } else {
+          Serial.println("ALARM: FAN STALLED. Will check again before turning off");
+          #if ENABLE_BLUETOOTH
+            SerialBT.println("ALARM: FAN STALLED. Will check again before turning off");
+          #endif
+        }
+      } else {
+        fan_fail_count = 0;  // Reset the fail counter if the fan is spinning
+      }
+    }
+  }
+}
+
+
 /**
  * Report the latest temperature reading
  */
@@ -655,21 +781,21 @@ void report_temperature()
     Serial.println("C");
 
     // Report to the BT serial port
-    #ifdef ENABLE_BLUETOOTH
+    #if ENABLE_BLUETOOTH
       SerialBT.print("Temperature: ");
       SerialBT.print(current_temperature);
       SerialBT.println("C");
     #endif
 
-    #ifdef ENABLE_MQTT
+    #if ENABLE_MQTT
       char mqttCharBuf[12];
       String mqttStringOne;
       mqttStringOne += current_temperature;
       mqttStringOne.toCharArray(mqttCharBuf, mqttStringOne.length()+1);
-      client.publish("stat/heater2/TEMP",mqttCharBuf);
+      client.publish(temperature_topic,mqttCharBuf);
     #endif
 
-    #ifdef ENABLE_CAN
+    #if ENABLE_CAN
       char charBuf[12];
       String stringOne = "Temp:";
       stringOne += current_temperature;
@@ -731,6 +857,8 @@ int getTemp() {
     
   // Convert Kelvin to Celsius
   celsius = kelvin - 273.15;
+
+  celsius += TEMPERATURE_OFFSET;
     
   // Send the value back to be displayed
   return celsius;
