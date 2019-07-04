@@ -64,10 +64,10 @@
   PubSubClient client(espClient);
   long lastMsg = 0;
   char msg[50];
-  char command_topic[20];
-  char status_topic[20];
+  char command_topic[30];
+  char status_topic[30];
   char temperature_topic[30];
-  char fan_topic[20];
+  char fan_topic[30];
 #endif
 
 
@@ -128,7 +128,7 @@ uint32_t fan_fail_count      = 0;   // We have to see it fail on multiple consec
 int16_t  current_temperature = 0;
 uint8_t  wifi_status_reported = false;
 uint64_t chip_id;
-char device_id[8];
+char device_id[18];
 
 #define FAN_FREQUENCY     15000   // PWM frequency for fan control
 #define FAN_CHANNEL           0   // PWM output channel for fan
@@ -157,17 +157,22 @@ void setup() {
   // Get a unique device ID to use for MQTT connections, Bluetooth, etc
   chip_id = ESP.getEfuseMac(); // The chip ID is essentially its MAC address (length 6 bytes)
   //sprintf(device_id, "%04X", (uint16_t)chip_id); // Just use the last 4 bytes
-  sprintf(device_id, "%08X", chip_id); // Use all the bytes
+  sprintf(device_id, "Heater-%08X", chip_id); // Use all the bytes
   Serial.print("Device ID: ");
   Serial.println(device_id);
 
   #if ENABLE_BLUETOOTH
-    char bt_id[16];
-    sprintf(bt_id,"Heater-%08X",device_id);
-    SerialBT.begin(bt_id); //Bluetooth device name
-    //SerialBT.begin("Heater2"+device_id); //Bluetooth device name
+    //char bt_id[18];
+    //sprintf(bt_id,"Heater-%08X",chip_id);
+    /* The BT "begin" below uses the current method in the Arduino IDE, which doesn't
+     *  support a PIN. PIN support was added in PR 2765:
+     *  https://github.com/espressif/arduino-esp32/pull/2765
+     *  When this has been released, we can replace the line below with a PIN such as:
+     *  SerialBT.begin(bt_id, 123456);
+     */
+    SerialBT.begin(device_id); //Bluetooth device name
     Serial.print("== Bluetooth has started. Pair with the device called '");
-    Serial.print(bt_id);
+    Serial.print(device_id);
     Serial.println("'");
   #else
     Serial.println("== Bluetooth not activated");
@@ -193,14 +198,20 @@ void setup() {
     Serial.println("== MQTT started");
     // Set up the topics for publishing sensor readings. By inserting the unique ID,
     // the result is of the form: "cmnd/D9616F/POWER"
-    sprintf(command_topic, "cmnd/%08X/POWER", chip_id);     // Receive power commands
-    sprintf(status_topic, "stat/%08X/POWER", chip_id);      // Report power status
-    sprintf(temperature_topic, "stat/%08X/TEMP", chip_id);  // Report temperature
-    sprintf(fan_topic, "stat/%08X/FAN", chip_id);           // Report fan speed
+    sprintf(command_topic, "cmnd/%s/POWER", device_id);     // Receive power commands
+    sprintf(status_topic, "stat/%s/POWER", device_id);      // Report power status
+    sprintf(temperature_topic, "stat/%s/TEMP", device_id);  // Report temperature
+    sprintf(fan_topic, "stat/%s/FAN", device_id);           // Report fan speed
     
     // Report the topics to the serial console
     Serial.print("Command topic: ");
     Serial.println(command_topic);
+    Serial.print("Status topic: ");
+    Serial.println(status_topic);
+    Serial.print("Temperature topic: ");
+    Serial.println(temperature_topic);
+    Serial.print("Fan speed topic: ");
+    Serial.println(fan_topic);
   #else
     Serial.println("== MQTT not activated");
   #endif
@@ -339,7 +350,7 @@ void reconnect_mqtt() {
     while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
       // Attempt to connect
-      if (client.connect("ESP32Client")) {
+      if (client.connect(device_id)) {
         Serial.println("connected");
         // Subscribe
       
