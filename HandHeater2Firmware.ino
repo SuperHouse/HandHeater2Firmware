@@ -70,6 +70,7 @@ CAN_device_t CAN_cfg;  // The variable name CAN_cfg is fixed, do not change
 #include <PubSubClient.h>
 PubSubClient client(espClient);
 long lastMsg = 0;
+long lastReconnectAttempt = 0;
 char msg[50];
 char command_topic[30];
 char status_topic[30];
@@ -341,29 +342,43 @@ void mqtt_callback(char* topic, byte* message, unsigned int length) {
 #endif
 
 /**
-   Attempt connection to broker
-*/
+ * Check if we have a WiFi connection, and attempt connection to broker
+ */
 #if ENABLE_MQTT
 void reconnect_mqtt() {
-  // Loop until we're reconnected
+  // Attempt to connect in a non-blocking way every 5 seconds
   if (WiFi.status() == WL_CONNECTED)
   {
-    while (!client.connected()) {
+    if (!client.connected()) {
+      long now = millis();
       Serial.print("Attempting MQTT connection...");
-      // Attempt to connect
-      if (client.connect(device_id)) {
-        Serial.println("connected");
-        // Subscribe
-        client.subscribe(command_topic);
-      } else {
-        Serial.print("failed, rc=");
-        Serial.print(client.state());
-        Serial.println(" try again in 5 seconds");
-        // Wait 5 seconds before retrying
-        delay(5000);
+      if (now - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = now;
+        // Attempt to reconnect
+        if (reconnect_mqtt_non_blocking()) {
+          lastReconnectAttempt = 0;
+        } else {
+          Serial.println("failed");
+        }
       }
+    } else {
+      // Client connected
+      client.loop();
     }
   }
+}
+#endif
+
+/**
+ * This should be non-blocking, but it still seems to be a problem
+ */
+#if ENABLE_MQTT
+boolean reconnect_mqtt_non_blocking() {
+  if (client.connect(device_id)) {
+    Serial.println("connected");
+    client.subscribe(command_topic);
+  }
+  return client.connected();
 }
 #endif
 
@@ -382,7 +397,7 @@ void initialise_can_bus()
   CAN_cfg.rx_queue = xQueueCreate(10, sizeof(CAN_frame_t));
   //initialize CAN Module
   ESP32Can.CANInit();
-}
+} 
 #endif
 
 /**
